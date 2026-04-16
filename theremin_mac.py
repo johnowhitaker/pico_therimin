@@ -21,7 +21,7 @@ DEFAULT_CONFIG = {
     "baudrate": 115200,
     "pitch_hand": {
         "raw_min": 5300.0,
-        "raw_max": 10000.0,
+        "raw_max": 10250.0,
         "hz_min": 220.0,
         "hz_max": 880.0,
         "invert": False,
@@ -40,7 +40,7 @@ DEFAULT_CONFIG = {
         "stale_after_s": 0.5,
     },
     "smoothing": {
-        "pitch_ms": 18.0,
+        "pitch_ms": 30.0,
         "volume_ms": 35.0,
     },
     "startup": {
@@ -247,24 +247,33 @@ def serial_reader(port, config, shared_state, stop_event, start_pico):
     smoothed_freq = None
     smoothed_level = None
     last_update_time = None
+    startup_attempts = 0
 
     while not stop_event.is_set():
         try:
             with serial.Serial(port, int(config["baudrate"]), timeout=1) as ser:
                 time.sleep(0.4)
-                if start_pico:
-                    start_pico_stream(ser)
-
                 with shared_state.lock:
                     shared_state.error = None
 
                 smoothed_freq = None
                 smoothed_level = None
                 last_update_time = None
+                saw_first_sample = False
+                started_pico = False
+                startup_deadline = time.time() + (2.5 if start_pico else 8.0)
 
                 while not stop_event.is_set():
                     line = ser.readline()
                     if not line:
+                        now = time.time()
+                        if not saw_first_sample and start_pico and not started_pico and now > startup_deadline:
+                            start_pico_stream(ser)
+                            started_pico = True
+                            startup_deadline = time.time() + 8.0
+                            continue
+                        if not saw_first_sample and now > startup_deadline:
+                            raise serial.SerialException("Timed out waiting for Pico samples after startup.")
                         continue
                     text = line.decode("utf-8", errors="replace").strip()
                     if not text or text.startswith((">>>", "...", "MicroPython", "Type \"help()\"")):
@@ -283,6 +292,8 @@ def serial_reader(port, config, shared_state, stop_event, start_pico):
 
                     target_freq_hz = pitch_from_raw(raw_pitch, config)
                     target_level = level_from_raw(raw_volume, config)
+                    saw_first_sample = True
+                    startup_attempts = 0
 
                     now = time.time()
                     dt = 0.0 if last_update_time is None else now - last_update_time
@@ -310,6 +321,14 @@ def serial_reader(port, config, shared_state, stop_event, start_pico):
         except serial.SerialException:
             if stop_event.is_set():
                 return
+            startup_attempts += 1
+            if startup_attempts >= 4:
+                with shared_state.lock:
+                    shared_state.error = RuntimeError(
+                        "Could not start the Pico stream after several attempts. Replug the Pico and try again."
+                    )
+                stop_event.set()
+                return
             time.sleep(0.5)
         except Exception as exc:
             with shared_state.lock:
@@ -319,6 +338,7 @@ def serial_reader(port, config, shared_state, stop_event, start_pico):
 
 
 def print_calibration_loop(shared_state, stop_event):
+    wait_for_samples(shared_state, stop_event)
     min_pitch = math.inf
     max_pitch = -math.inf
     min_volume = math.inf
@@ -355,7 +375,7 @@ def print_calibration_loop(shared_state, stop_event):
         time.sleep(0.02)
 
 
-def wait_for_samples(shared_state, stop_event, timeout_s=8.0):
+def wait_for_samples(shared_state, stop_event, timeout_s=20.0):
     deadline = time.time() + timeout_s
     while time.time() < deadline and not stop_event.is_set():
         with shared_state.lock:
@@ -366,7 +386,10 @@ def wait_for_samples(shared_state, stop_event, timeout_s=8.0):
         if seen:
             return
         time.sleep(0.05)
-    raise RuntimeError("Timed out waiting for Pico samples.")
+    raise RuntimeError(
+        "Timed out waiting for Pico samples. Replug the Pico and try again. "
+        "If it still happens, run `python3 theremin_mac.py --install-pico` once and retry."
+    )
 
 
 def countdown(seconds, message):
@@ -409,15 +432,15 @@ def capture_pose(shared_state, stop_event, duration_s):
     }
 
 
-def calibrate_range(first_value, second_value, minimum_span):
+def calibrate_range(first_value, second_value, minimum_span, padding):
     raw_min = min(first_value, second_value)
     raw_max = max(first_value, second_value)
     span = raw_max - raw_min
     if span >= minimum_span:
-        return raw_min, raw_max
+        return raw_min - padding, raw_max + padding
 
     midpoint = (raw_min + raw_max) * 0.5
-    half_span = minimum_span * 0.5
+    half_span = (minimum_span * 0.5) + padding
     return midpoint - half_span, midpoint + half_span
 
 
@@ -436,8 +459,18 @@ def apply_guided_calibration(shared_state, stop_event, config, config_path):
     )
     far_capture = capture_pose(shared_state, stop_event, float(config["startup"]["capture_s"]))
 
-    pitch_min, pitch_max = calibrate_range(close_capture["pitch"], far_capture["pitch"], minimum_span=60.0)
-    volume_min, volume_max = calibrate_range(close_capture["volume"], far_capture["volume"], minimum_span=80.0)
+    pitch_min, pitch_max = calibrate_range(
+        close_capture["pitch"],
+        far_capture["pitch"],
+        minimum_span=180.0,
+        padding=25.0,
+    )
+    volume_min, volume_max = calibrate_range(
+        close_capture["volume"],
+        far_capture["volume"],
+        minimum_span=120.0,
+        padding=20.0,
+    )
     config["pitch_hand"]["raw_min"] = pitch_min
     config["pitch_hand"]["raw_max"] = pitch_max
     config["volume_hand"]["raw_min"] = volume_min

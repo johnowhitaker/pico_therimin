@@ -7,7 +7,8 @@ SENSE_PITCH_PIN = 26
 SENSE_VOLUME_PIN = 27
 KICK_PIN = 20
 STATE_MACHINE_FREQ = 125_000_000
-READING_REPS = 4390
+# Average across roughly three 60 Hz mains periods to reduce hum-driven wobble.
+READING_REPS = 4390 * 3
 
 
 @rp2.asm_pio(set_init=rp2.PIO.OUT_LOW, out_init=rp2.PIO.OUT_LOW)

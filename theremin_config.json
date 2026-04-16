@@ -2,15 +2,15 @@
   "serial_port": null,
   "baudrate": 115200,
   "pitch_hand": {
-    "raw_min": 10995.705,
-    "raw_max": 11298.54,
+    "raw_min": 4323.13,
+    "raw_max": 4957.09,
     "hz_min": 220.0,
     "hz_max": 880.0,
     "invert": false
   },
   "volume_hand": {
-    "raw_min": 4711.195,
-    "raw_max": 5032.38,
+    "raw_min": 4520.98,
+    "raw_max": 5289.13,
     "level_min": 0.0,
     "level_max": 0.9,
     "invert": true
@@ -22,7 +22,7 @@
     "stale_after_s": 0.5
   },
   "smoothing": {
-    "pitch_ms": 18.0,
+    "pitch_ms": 30.0,
     "volume_ms": 35.0
   },
   "startup": {

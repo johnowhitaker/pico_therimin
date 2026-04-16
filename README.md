@@ -28,6 +28,12 @@ python3 theremin_mac.py
 
 The Mac script now starts `theremin_pico.py` over serial each time, so it does not depend on the Pico auto-starting the streamer at boot.
 
+If you want a guided calibration before audio starts:
+
+```bash
+python3 theremin_mac.py --calibrate-on-start
+```
+
 ## Calibration
 
 To watch raw values and collect min/max ranges:
@@ -43,6 +49,9 @@ Move each hand through the range you want, note the raw min/max values, then edi
 - `pitch_hand.hz_min` / `pitch_hand.hz_max` set the note range
 - `volume_hand.level_max` sets the loudest output level
 - `invert` flips a hand direction if needed
+- `startup.calibrate_on_start` enables the guided close/far calibration flow on launch
+- `startup.countdown_s` and `startup.capture_s` control how long the guided calibration waits and samples
+- `smoothing.pitch_ms` and `smoothing.volume_ms` control how aggressively sudden jumps are damped
 
 ## Useful Commands
 

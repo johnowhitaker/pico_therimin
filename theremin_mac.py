@@ -3,6 +3,7 @@ import json
 import math
 import os
 import re
+import statistics
 import subprocess
 import sys
 import threading
@@ -37,6 +38,15 @@ DEFAULT_CONFIG = {
         "block_size": 512,
         "status_hz": 4.0,
         "stale_after_s": 0.5,
+    },
+    "smoothing": {
+        "pitch_ms": 18.0,
+        "volume_ms": 35.0,
+    },
+    "startup": {
+        "calibrate_on_start": False,
+        "countdown_s": 3.0,
+        "capture_s": 1.25,
     },
 }
 
@@ -105,6 +115,10 @@ def ensure_config(path):
         path.write_text(json.dumps(DEFAULT_CONFIG, indent=2) + "\n")
     with path.open() as fh:
         return merge_dict(DEFAULT_CONFIG, json.load(fh))
+
+
+def save_config(path, config):
+    path.write_text(json.dumps(config, indent=2) + "\n")
 
 
 def find_serial_port(preferred, wait_seconds=12.0):
@@ -208,6 +222,16 @@ def level_from_raw(raw_value, config):
     return level_min + (level_max - level_min) * (normalized ** 2)
 
 
+def smooth_value(current, target, dt, smoothing_ms):
+    if current is None:
+        return target
+    if smoothing_ms <= 0.0 or dt <= 0.0:
+        return target
+    tau = smoothing_ms / 1000.0
+    alpha = 1.0 - math.exp(-dt / tau)
+    return current + (target - current) * alpha
+
+
 def start_pico_stream(ser):
     ser.reset_input_buffer()
     ser.write(b"\x03")
@@ -220,6 +244,10 @@ def start_pico_stream(ser):
 
 
 def serial_reader(port, config, shared_state, stop_event, start_pico):
+    smoothed_freq = None
+    smoothed_level = None
+    last_update_time = None
+
     while not stop_event.is_set():
         try:
             with serial.Serial(port, int(config["baudrate"]), timeout=1) as ser:
@@ -229,6 +257,10 @@ def serial_reader(port, config, shared_state, stop_event, start_pico):
 
                 with shared_state.lock:
                     shared_state.error = None
+
+                smoothed_freq = None
+                smoothed_level = None
+                last_update_time = None
 
                 while not stop_event.is_set():
                     line = ser.readline()
@@ -249,15 +281,32 @@ def serial_reader(port, config, shared_state, stop_event, start_pico):
                     except ValueError:
                         continue
 
-                    freq_hz = pitch_from_raw(raw_pitch, config)
-                    level = level_from_raw(raw_volume, config)
+                    target_freq_hz = pitch_from_raw(raw_pitch, config)
+                    target_level = level_from_raw(raw_volume, config)
+
+                    now = time.time()
+                    dt = 0.0 if last_update_time is None else now - last_update_time
+                    last_update_time = now
+
+                    smoothed_freq = smooth_value(
+                        smoothed_freq,
+                        target_freq_hz,
+                        dt,
+                        float(config["smoothing"]["pitch_ms"]),
+                    )
+                    smoothed_level = smooth_value(
+                        smoothed_level,
+                        target_level,
+                        dt,
+                        float(config["smoothing"]["volume_ms"]),
+                    )
 
                     with shared_state.lock:
                         shared_state.raw_pitch = raw_pitch
                         shared_state.raw_volume = raw_volume
-                        shared_state.freq_hz = freq_hz
-                        shared_state.level = level
-                        shared_state.last_data_time = time.time()
+                        shared_state.freq_hz = smoothed_freq
+                        shared_state.level = smoothed_level
+                        shared_state.last_data_time = now
         except serial.SerialException:
             if stop_event.is_set():
                 return
@@ -304,6 +353,109 @@ def print_calibration_loop(shared_state, stop_event):
                 flush=True,
             )
         time.sleep(0.02)
+
+
+def wait_for_samples(shared_state, stop_event, timeout_s=8.0):
+    deadline = time.time() + timeout_s
+    while time.time() < deadline and not stop_event.is_set():
+        with shared_state.lock:
+            seen = shared_state.last_data_time
+            error = shared_state.error
+        if error:
+            raise error
+        if seen:
+            return
+        time.sleep(0.05)
+    raise RuntimeError("Timed out waiting for Pico samples.")
+
+
+def countdown(seconds, message):
+    print(message, flush=True)
+    whole_seconds = max(1, int(math.ceil(seconds)))
+    for remaining in range(whole_seconds, 0, -1):
+        print(f"  {remaining}...", flush=True)
+        time.sleep(1.0)
+
+
+def capture_pose(shared_state, stop_event, duration_s):
+    end_time = time.time() + duration_s
+    pitch_values = []
+    volume_values = []
+    last_seen = 0.0
+
+    while time.time() < end_time and not stop_event.is_set():
+        with shared_state.lock:
+            raw_pitch = shared_state.raw_pitch
+            raw_volume = shared_state.raw_volume
+            seen = shared_state.last_data_time
+            error = shared_state.error
+
+        if error:
+            raise error
+
+        if seen and seen != last_seen:
+            last_seen = seen
+            pitch_values.append(raw_pitch)
+            volume_values.append(raw_volume)
+
+        time.sleep(0.01)
+
+    if not pitch_values or not volume_values:
+        raise RuntimeError("No calibration samples were captured.")
+
+    return {
+        "pitch": statistics.median(pitch_values),
+        "volume": statistics.median(volume_values),
+    }
+
+
+def calibrate_range(first_value, second_value, minimum_span):
+    raw_min = min(first_value, second_value)
+    raw_max = max(first_value, second_value)
+    span = raw_max - raw_min
+    if span >= minimum_span:
+        return raw_min, raw_max
+
+    midpoint = (raw_min + raw_max) * 0.5
+    half_span = minimum_span * 0.5
+    return midpoint - half_span, midpoint + half_span
+
+
+def apply_guided_calibration(shared_state, stop_event, config, config_path):
+    wait_for_samples(shared_state, stop_event)
+
+    countdown(
+        float(config["startup"]["countdown_s"]),
+        "Guided calibration: get ready to place both hands at their closest playing positions.",
+    )
+    close_capture = capture_pose(shared_state, stop_event, float(config["startup"]["capture_s"]))
+
+    countdown(
+        float(config["startup"]["countdown_s"]),
+        "Now move both hands to their farthest playing positions.",
+    )
+    far_capture = capture_pose(shared_state, stop_event, float(config["startup"]["capture_s"]))
+
+    pitch_min, pitch_max = calibrate_range(close_capture["pitch"], far_capture["pitch"], minimum_span=60.0)
+    volume_min, volume_max = calibrate_range(close_capture["volume"], far_capture["volume"], minimum_span=80.0)
+    config["pitch_hand"]["raw_min"] = pitch_min
+    config["pitch_hand"]["raw_max"] = pitch_max
+    config["volume_hand"]["raw_min"] = volume_min
+    config["volume_hand"]["raw_max"] = volume_max
+    save_config(config_path, config)
+
+    print(
+        (
+            "Saved calibration: "
+            "pitch=[{:.2f}, {:.2f}] volume=[{:.2f}, {:.2f}]"
+        ).format(
+            float(config["pitch_hand"]["raw_min"]),
+            float(config["pitch_hand"]["raw_max"]),
+            float(config["volume_hand"]["raw_min"]),
+            float(config["volume_hand"]["raw_max"]),
+        ),
+        flush=True,
+    )
 
 
 def run_audio_loop(shared_state, config, stop_event):
@@ -364,6 +516,11 @@ def build_parser():
         help="Start theremin_pico.py over the serial REPL. This is now the default behavior.",
     )
     parser.add_argument("--calibrate", action="store_true", help="Print raw values and rolling min/max instead of audio.")
+    parser.add_argument(
+        "--calibrate-on-start",
+        action="store_true",
+        help="Run a guided close/far calibration and save the new ranges before starting audio.",
+    )
     parser.add_argument("--list-audio-devices", action="store_true", help="List output devices and exit.")
     return parser
 
@@ -379,6 +536,7 @@ def main():
     port = find_serial_port(args.port or config.get("serial_port"))
     pico_script = Path(__file__).with_name("theremin_pico.py")
     start_pico = True
+    calibrate_on_start = bool(args.calibrate_on_start or config["startup"]["calibrate_on_start"])
 
     if args.install_pico:
         install_pico_script(port, pico_script)
@@ -399,6 +557,8 @@ def main():
         if args.calibrate:
             print_calibration_loop(shared_state, stop_event)
         else:
+            if calibrate_on_start:
+                apply_guided_calibration(shared_state, stop_event, config, args.config)
             run_audio_loop(shared_state, config, stop_event)
     except KeyboardInterrupt:
         pass
